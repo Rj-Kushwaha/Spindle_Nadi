@@ -1,0 +1,13 @@
+.venv/
+venv/
+.agents/
+.claude/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.DS_Store
+.streamlit/secrets.toml
+data/generated/live_sensor_readings.csv
+data/generated/maintenance_history.csv
+data/generated/event_timeline.csv
+*.joblib
