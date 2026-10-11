@@ -22,7 +22,7 @@ initial package installation.
 python -m venv .venv
 source .venv/bin/activate          # Windows PowerShell: .venv\Scripts\Activate.ps1
 python -m pip install -r requirements.txt
-streamlit run app.py
+./run.sh
 ```
 
 Streamlit prints the local dashboard URL (usually `http://localhost:8501`).
@@ -182,7 +182,7 @@ and the runtime dependencies are in `requirements.txt`.
 Recorded CSV replay accepts a timestamp column (`timestamp`, `time`, or
 `datetime`) plus one or more recognized sensor headers; it displays only the
 uploaded values and does not produce an AI risk score. For genuinely live
-machine data, connect a read-only adapter to the controller or data gateway
+machine data, connect a read-only adapter to the controller or data gate./run.shway
 (for example, the site's approved OPC UA, MTConnect, or MQTT interface), map
 its documented tags and units, and validate access with the machine owner.
 That integration needs the specific machine, controller protocol, tag list,
