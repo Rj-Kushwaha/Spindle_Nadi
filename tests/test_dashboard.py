@@ -23,6 +23,7 @@ class DashboardInteractionTests(unittest.TestCase):
                 pipeline=pipeline,
             )
             original_workload = service.simulators["CNC-01"].workload
+            original_rpm = service.simulators["CNC-01"].rpm_setpoint
 
             app = AppTest.from_file(str(Path(__file__).resolve().parents[1] / "app.py"))
             app.session_state["service"] = service
@@ -33,25 +34,46 @@ class DashboardInteractionTests(unittest.TestCase):
             self.assertIn("What-if", [tab.label for tab in app.tabs])
             self.assertIn("Digital twin", [tab.label for tab in app.tabs])
             self.assertIn("Evidence timeline", [tab.label for tab in app.tabs])
+            self.assertIn("Recorded data replay", [tab.label for tab in app.tabs])
+            self.assertIn("Alerts & messages", [tab.label for tab in app.tabs])
+            self.assertIn("Alternative spindle speed (RPM)", [slider.label for slider in app.slider])
 
+            app.toggle(key="spoken_alerts_CNC-01").set_value(True).run(timeout=60)
+            self.assertFalse(app.exception)
+
+            next(button for button in app.button if button.label == "Send test notification").click().run(
+                timeout=60
+            )
+            self.assertFalse(app.exception)
+            self.assertEqual(service.notification_history[-1]["event_type"], "TEST")
+
+            app.slider(key="what_if_rpm_CNC-01").set_value(9000)
             next(button for button in app.button if button.label == "Run paired what-if").click().run(timeout=60)
             self.assertFalse(app.exception)
             self.assertIn("what_if_result_CNC-01", app.session_state)
             self.assertEqual(service.simulators["CNC-01"].workload, original_workload)
+            self.assertEqual(service.simulators["CNC-01"].rpm_setpoint, original_rpm)
 
-            app.text_input(key="copilot_question_CNC-01").set_value("Why is this machine at risk?").run(timeout=60)
-            next(button for button in app.button if button.label == "Ask copilot").click().run(timeout=60)
+            app.chat_input(key="copilot_chat_input_CNC-01").set_value(
+                "Why is this machine at risk?"
+            ).run(timeout=60)
             self.assertFalse(app.exception)
-            self.assertIn("CNC-01", app.session_state["copilot_answer_CNC-01"])
+            messages = app.session_state["copilot_messages_CNC-01"]
+            self.assertEqual(messages[-2]["role"], "user")
+            self.assertEqual(messages[-1]["role"], "assistant")
+            self.assertIn("CNC-01", messages[-1]["content"])
 
             service.start_degradation("CNC-01")
             service.advance("CNC-01", 16)
             app.run(timeout=60)
+            self.assertFalse(app.exception)
+            self.assertEqual(app.session_state["spoken_alert_status_CNC-01"], "CRITICAL")
             next(
                 button for button in app.button
                 if button.label == "Perform virtual maintenance"
             ).click().run(timeout=60)
             self.assertFalse(app.exception)
+            self.assertEqual(app.session_state["spoken_alert_status_CNC-01"], "NORMAL")
             result = app.session_state["maintenance_outcome_CNC-01"]
             self.assertLess(result["after"]["risk"], result["before"]["risk"])
             self.assertEqual(service.event_timeline[-1]["event_type"], "VIRTUAL_MAINTENANCE")

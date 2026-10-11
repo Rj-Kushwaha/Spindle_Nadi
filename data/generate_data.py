@@ -8,24 +8,25 @@ from pathlib import Path
 
 import pandas as pd
 
-from simulator import MachineSimulator
+from simulator import FAULT_MODES, MachineSimulator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_OUTPUT = PROJECT_ROOT / "data" / "generated" / "synthetic_sensor_data.csv"
 DEFAULT_WORKLOADS = (25.0, 35.0, 45.0, 55.0, 65.0, 75.0, 85.0, 95.0)
+DEFAULT_RPM_SETPOINTS = (900.0, 1800.0, 3000.0, 4500.0, 6000.0, 7500.0, 9000.0)
 
 
 def generate_dataset(
     output_path: str | Path = DEFAULT_OUTPUT,
     seed: int = 42,
     normal_samples: int = 12,
-    machine_count: int = 8,
+    machine_count: int = 10,
 ) -> pd.DataFrame:
     """Generate healthy, degrading, and near-failure time series for a fleet."""
     if normal_samples < 1:
         raise ValueError("normal_samples must be at least 1")
-    if machine_count < 2:
-        raise ValueError("machine_count must be at least 2 for group evaluation")
+    if machine_count < len(FAULT_MODES):
+        raise ValueError(f"machine_count must be at least {len(FAULT_MODES)} to cover each fault mode")
 
     rows: list[dict[str, str | float]] = []
     for machine_number in range(machine_count):
@@ -34,10 +35,11 @@ def generate_dataset(
             machine_id=f"CNC-{machine_number + 1:02d}",
             seed=seed + machine_number,
             workload=workload,
+            rpm_setpoint=DEFAULT_RPM_SETPOINTS[machine_number % len(DEFAULT_RPM_SETPOINTS)],
         )
         base_time = datetime(2025, 1, 1, tzinfo=timezone.utc) + timedelta(days=machine_number)
         rows.extend(_sample_row(simulator, base_time) for _ in range(normal_samples))
-        simulator.start_degradation()
+        simulator.start_degradation(FAULT_MODES[machine_number % len(FAULT_MODES)])
         while simulator.degradation < 1.0:
             rows.append(_sample_row(simulator, base_time))
         simulator.set_near_failure()
@@ -62,7 +64,7 @@ def main() -> None:
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--normal-samples", type=int, default=12)
-    parser.add_argument("--machines", type=int, default=8)
+    parser.add_argument("--machines", type=int, default=10)
     args = parser.parse_args()
     frame = generate_dataset(args.output, args.seed, args.normal_samples, args.machines)
     print(f"Saved {len(frame)} sensor readings for {frame['machine_id'].nunique()} machines to {args.output}")

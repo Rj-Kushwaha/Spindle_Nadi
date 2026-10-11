@@ -7,6 +7,7 @@ import pandas as pd
 from data.generate_data import generate_dataset
 from ml.features import FEATURE_COLUMNS, engineer_features
 from ml.pipeline import SpindleNadiPipeline
+from ml.prediction.risk_model import status_for_risk
 from simulator import MachineSimulator
 
 
@@ -27,6 +28,19 @@ class FeatureEngineeringTests(unittest.TestCase):
             set(first["scenario"]),
             {"NORMAL", "DEGRADATION", "NEAR_FAILURE"},
         )
+        self.assertEqual(
+            set(first["fault_mode"]) - {"NONE"},
+            {"bearing_wear", "cooling_degradation", "lubrication_loss", "tool_wear", "spindle_imbalance"},
+        )
+        self.assertGreater(first["rpm_setpoint"].nunique(), 1)
+
+    def test_healthy_operating_point_adjustments_normalize_rpm_changes(self) -> None:
+        low_speed = MachineSimulator(seed=14, workload=60, rpm_setpoint=1800).step().to_dict()
+        high_speed = MachineSimulator(seed=14, workload=60, rpm_setpoint=9000).step().to_dict()
+        features = engineer_features(pd.DataFrame([low_speed, high_speed]))
+
+        for feature in ("temperature_excess", "vibration_excess", "current_excess", "rpm_drop"):
+            self.assertAlmostEqual(features.loc[0, feature], features.loc[1, feature], delta=0.05)
 
     def test_invalid_sensor_frame_reports_missing_columns(self) -> None:
         with self.assertRaisesRegex(ValueError, "missing required columns"):
@@ -55,6 +69,13 @@ class SpindleNadiPipelineTests(unittest.TestCase):
         self.assertIn("f1", metrics)
         self.assertEqual(len(metrics["confusion_matrix"]), 2)
 
+    def test_model_risk_threshold_boundaries(self) -> None:
+        self.assertEqual(status_for_risk(0.4999), "NORMAL")
+        self.assertEqual(status_for_risk(0.50), "WARNING")
+        self.assertEqual(status_for_risk(0.6499), "WARNING")
+        self.assertEqual(status_for_risk(0.8499), "WARNING")
+        self.assertEqual(status_for_risk(0.85), "CRITICAL")
+
     def test_model_risk_and_explanations_rise_with_degradation(self) -> None:
         simulator = MachineSimulator(seed=5)
         history: list[dict[str, str | float]] = []
@@ -71,6 +92,10 @@ class SpindleNadiPipelineTests(unittest.TestCase):
         self.assertGreaterEqual(degraded_result.rul_hours, 0.0)
         self.assertEqual(len(degraded_result.explanations), 5)
         self.assertGreater(degraded_result.anomaly_score, healthy_result.anomaly_score)
+        self.assertTrue(
+            {"bearing_temperature_excess", "coolant_flow_drop", "lubrication_pressure_drop"}
+            .issubset(FEATURE_COLUMNS)
+        )
 
 
 if __name__ == "__main__":

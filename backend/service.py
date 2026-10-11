@@ -4,25 +4,33 @@ from __future__ import annotations
 
 import csv
 import copy
+from datetime import datetime, timezone
+import math
 from pathlib import Path
 from typing import Any
 
 import pandas as pd
 
 from data.generate_data import DEFAULT_OUTPUT, generate_dataset
+from ml.features import REQUIRED_SENSOR_COLUMNS
 from ml.pipeline import MachineAnalysis, SpindleNadiPipeline
+from ml.prediction.risk_model import CRITICAL_THRESHOLD, WARNING_THRESHOLD
 from simulator import MachineSimulator
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 LIVE_DATA_PATH = PROJECT_ROOT / "data" / "generated" / "live_sensor_readings.csv"
 MAINTENANCE_PATH = PROJECT_ROOT / "data" / "generated" / "maintenance_history.csv"
 EVENT_TIMELINE_PATH = PROJECT_ROOT / "data" / "generated" / "event_timeline.csv"
+NOTIFICATION_HISTORY_PATH = PROJECT_ROOT / "data" / "generated" / "notification_history.csv"
 
 FIXED_LIMITS = {
     "temperature": 75.0,
     "vibration": 3.0,
     "motor_current": 12.5,
     "rpm": 1600.0,
+    "bearing_temperature_c": 80.0,
+    "coolant_flow_lpm": 4.0,
+    "lubrication_pressure_bar": 1.0,
 }
 
 SENSOR_FIELDS = [
@@ -30,17 +38,33 @@ SENSOR_FIELDS = [
     "machine_id",
     "temperature",
     "vibration",
+    "vibration_x",
+    "vibration_y",
+    "vibration_z",
     "motor_current",
+    "rpm_setpoint",
     "rpm",
+    "spindle_load_pct",
+    "torque_nm",
+    "bearing_temperature_c",
+    "coolant_flow_lpm",
+    "coolant_temperature_c",
+    "lubrication_pressure_bar",
+    "acoustic_noise_db",
+    "feed_rate_mm_min",
+    "tool_wear_pct_est",
+    "power_kw_est",
     "operating_hours",
     "workload",
     "scenario",
+    "fault_mode",
     "degradation",
     "risk",
     "status",
     "anomaly_score",
     "is_anomaly",
     "rul_hours",
+    "health_score",
 ]
 MAINTENANCE_FIELDS = [
     "timestamp",
@@ -61,6 +85,19 @@ EVENT_FIELDS = [
     "risk_after",
     "details",
 ]
+NOTIFICATION_FIELDS = [
+    "timestamp",
+    "machine_id",
+    "event_type",
+    "status",
+    "risk",
+    "message",
+    "dashboard_status",
+    "email_status",
+    "email_detail",
+    "whatsapp_status",
+    "whatsapp_detail",
+]
 
 
 class SpindleNadiService:
@@ -73,14 +110,20 @@ class SpindleNadiService:
         event_timeline_path: str | Path = EVENT_TIMELINE_PATH,
         training_path: str | Path = DEFAULT_OUTPUT,
         pipeline: SpindleNadiPipeline | None = None,
+        notification_path: str | Path = NOTIFICATION_HISTORY_PATH,
+        notifier: Any | None = None,
     ) -> None:
         self.live_data_path = Path(live_data_path)
         self.maintenance_path = Path(maintenance_path)
         self.event_timeline_path = Path(event_timeline_path)
+        self.notification_path = Path(notification_path)
+        self.notifier = notifier
         training_file = Path(training_path)
         if training_file.exists():
             training_data = pd.read_csv(training_file)
         else:
+            training_data = generate_dataset(training_file)
+        if REQUIRED_SENSOR_COLUMNS.difference(training_data.columns):
             training_data = generate_dataset(training_file)
         self.pipeline = pipeline or SpindleNadiPipeline(training_data)
 
@@ -101,6 +144,7 @@ class SpindleNadiService:
         self._last_status = {machine_id: "NORMAL" for machine_id in self.simulators}
         self.maintenance_history = self._read_maintenance_history()
         self.event_timeline = self._read_event_timeline()
+        self.notification_history = self._read_notification_history()
         for machine_id in self.simulators:
             self.advance(machine_id)
 
@@ -135,8 +179,8 @@ class SpindleNadiService:
             ),
         )
 
-    def start_degradation(self, machine_id: str) -> None:
-        self._simulator(machine_id).start_degradation()
+    def start_degradation(self, machine_id: str, fault_mode: str = "bearing_wear") -> None:
+        self._simulator(machine_id).start_degradation(fault_mode)
 
     def set_near_failure(self, machine_id: str) -> None:
         self._simulator(machine_id).set_near_failure()
@@ -146,6 +190,153 @@ class SpindleNadiService:
 
     def set_workload(self, machine_id: str, workload: float) -> None:
         self._simulator(machine_id).set_workload(workload)
+
+    def set_rpm_setpoint(self, machine_id: str, rpm_setpoint: float) -> None:
+        self._simulator(machine_id).set_rpm_setpoint(rpm_setpoint)
+
+    @staticmethod
+    def sensor_health(record: dict[str, Any], max_age_seconds: float = 30.0) -> dict[str, Any]:
+        """Check required synthetic channels for missing, invalid, implausible, or stale values."""
+        ranges = {
+            "temperature": (-20.0, 200.0),
+            "vibration": (0.0, 100.0),
+            "vibration_x": (0.0, 100.0),
+            "vibration_y": (0.0, 100.0),
+            "vibration_z": (0.0, 100.0),
+            "motor_current": (0.0, 1000.0),
+            "rpm": (0.0, 30_000.0),
+            "rpm_setpoint": (500.0, 30_000.0),
+            "spindle_load_pct": (0.0, 100.0),
+            "torque_nm": (0.0, 100_000.0),
+            "bearing_temperature_c": (-20.0, 200.0),
+            "coolant_flow_lpm": (0.0, 1000.0),
+            "coolant_temperature_c": (-20.0, 200.0),
+            "lubrication_pressure_bar": (0.0, 1000.0),
+            "acoustic_noise_db": (0.0, 200.0),
+            "feed_rate_mm_min": (0.0, 100_000.0),
+            "tool_wear_pct_est": (0.0, 100.0),
+            "power_kw_est": (0.0, 100_000.0),
+        }
+        issues = []
+        valid_count = 0
+        for channel, (minimum, maximum) in ranges.items():
+            value = record.get(channel)
+            if value is None:
+                issues.append({"sensor": channel, "issue": "missing"})
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                issues.append({"sensor": channel, "issue": "not numeric"})
+                continue
+            if not math.isfinite(numeric_value):
+                issues.append({"sensor": channel, "issue": "not finite"})
+                continue
+            if not minimum <= numeric_value <= maximum:
+                issues.append({"sensor": channel, "issue": "outside broad plausibility range"})
+                continue
+            valid_count += 1
+
+        timestamp = record.get("timestamp")
+        try:
+            sample_time = datetime.fromisoformat(str(timestamp).replace("Z", "+00:00"))
+            if sample_time.tzinfo is None:
+                sample_time = sample_time.replace(tzinfo=timezone.utc)
+            age_seconds = max(0.0, (datetime.now(timezone.utc) - sample_time.astimezone(timezone.utc)).total_seconds())
+            if age_seconds > max_age_seconds:
+                issues.append({"sensor": "timestamp", "issue": f"stale ({age_seconds:.0f}s old)"})
+        except (TypeError, ValueError):
+            age_seconds = None
+            issues.append({"sensor": "timestamp", "issue": "missing or invalid"})
+
+        if valid_count == 0:
+            status = "UNAVAILABLE"
+        elif issues:
+            status = "CHECK"
+        else:
+            status = "HEALTHY"
+        return {
+            "status": status,
+            "quality_pct": round(valid_count / len(ranges) * 100.0),
+            "valid_channels": valid_count,
+            "total_channels": len(ranges),
+            "age_seconds": age_seconds,
+            "issues": issues,
+        }
+
+    def maintenance_report(self, machine_id: str) -> str:
+        """Render a downloadable, evidence-grounded report for one machine."""
+        record = self.latest(self._simulator(machine_id).machine_id)
+        sensor_health = self.sensor_health(record)
+        comparison = self.comparison(record)
+        history = self.records_for(machine_id)
+        risk_trend = "insufficient readings"
+        if len(history) >= 2:
+            midpoint = max(1, len(history) // 2)
+            earlier = float(history.iloc[:midpoint]["risk"].mean())
+            recent = float(history.iloc[midpoint:]["risk"].mean())
+            risk_trend = f"{earlier:.0%} average earlier → {recent:.0%} average recent"
+        explanations = "\n".join(
+            f"- {item['feature']}: estimated contribution {float(item['contribution']):.3f}"
+            for item in record["explanations"][:5]
+        ) or "- No ranked factors available"
+        alerts = [
+            row for row in self.notification_history
+            if row["machine_id"] == machine_id
+        ][-10:]
+        alert_lines = "\n".join(
+            f"- {row['timestamp']}: {row['event_type']} — email {row['email_status']}, "
+            f"WhatsApp {row['whatsapp_status']}"
+            for row in alerts
+        ) or "- No alerts recorded"
+        recommendation = self.recommend_maintenance(record["explanations"][:3])
+        issues = "\n".join(
+            f"- {item['sensor']}: {item['issue']}"
+            for item in sensor_health["issues"]
+        ) or "- No channel-quality issues detected"
+        maintenance = [
+            row for row in self.maintenance_history
+            if row["machine_id"] == machine_id
+        ][-10:]
+        maintenance_lines = "\n".join(
+            f"- {row['timestamp']}: {row['alert']} — {row['reason']}; {row['recommendation']}"
+            for row in maintenance
+        ) or "- No maintenance events recorded"
+        return (
+            f"# Spindle Nadi maintenance report — {machine_id}\n\n"
+            f"- Generated: {datetime.now(timezone.utc).isoformat(timespec='seconds')}\n"
+            f"- Data source: synthetic simulator\n"
+            f"- Status: {record['status']}\n"
+            f"- Estimated risk: {record['risk']:.0%}\n"
+            f"- Prototype health score: {record['health_score']}/100\n"
+            "- Health score definition: 100 × (1 − model-estimated risk); not measured equipment health\n"
+            f"- Prototype RUL: {record['rul_hours']:.2f} simulated hours\n"
+            f"- Operating time: {record['operating_hours']:.2f} simulated hours\n"
+            f"- Scenario / fault mode: {record['scenario']} / {record['fault_mode']}\n"
+            f"- Sensor quality: {sensor_health['status']} "
+            f"({sensor_health['quality_pct']}%, {sensor_health['valid_channels']}/"
+            f"{sensor_health['total_channels']} channels)\n\n"
+            "## Risk trend\n\n"
+            f"{risk_trend}\n\n"
+            "## WHY — model evidence\n\n"
+            f"{explanations}\n\n"
+            "## Sensor quality checks\n\n"
+            f"{issues}\n\n"
+            "## AI vs fixed comparator\n\n"
+            f"- Model: {record['status']} at {record['risk']:.0%} estimated risk\n"
+            f"- Illustrative fixed alarm: {'ALARM' if comparison['fixed_alarm'] else 'no limit crossed'}\n"
+            f"- Crossed limits: {', '.join(comparison['crossed_limits']) or 'none'}\n\n"
+            "## Suggested prototype action\n\n"
+            f"{recommendation}\n\n"
+            "## Alert delivery history\n\n"
+            f"{alert_lines}\n\n"
+            "## Maintenance history\n\n"
+            f"{maintenance_lines}\n\n"
+            "## Limitations\n\n"
+            "All readings and model estimates in this report are from a synthetic prototype. "
+            "Health score, RUL, thresholds, and recommendations are not validated for real equipment "
+            "and must not be used as safety instructions.\n"
+        )
 
     def reset(self, machine_id: str) -> dict[str, Any]:
         simulator = self._simulator(machine_id)
@@ -201,10 +392,13 @@ class SpindleNadiService:
         machine_id: str,
         workload: float,
         samples: int = 10,
+        rpm_setpoint: float | None = None,
     ) -> dict[str, Any]:
         """Compare paired future simulations without changing live machine state."""
         self._simulator(machine_id)
         MachineSimulator._validate_workload(workload)
+        current_rpm = self.simulators[machine_id].rpm_setpoint
+        alternate_rpm = current_rpm if rpm_setpoint is None else MachineSimulator._validate_rpm(rpm_setpoint)
         if samples < 1 or samples > 100:
             raise ValueError("samples must be between 1 and 100")
 
@@ -213,12 +407,15 @@ class SpindleNadiService:
         what_if_simulator = copy.deepcopy(self.simulators[machine_id])
         baseline_result = self._project(baseline_simulator, history, samples)
         what_if_simulator.set_workload(workload)
+        what_if_simulator.set_rpm_setpoint(alternate_rpm)
         what_if_result = self._project(what_if_simulator, history, samples)
 
         return {
             "machine_id": machine_id,
             "current_workload": self.simulators[machine_id].workload,
             "what_if_workload": float(workload),
+            "current_rpm_setpoint": current_rpm,
+            "what_if_rpm_setpoint": alternate_rpm,
             "samples": samples,
             "revision": self._revision[machine_id],
             "baseline": baseline_result,
@@ -229,13 +426,22 @@ class SpindleNadiService:
                     what_if_result[sensor] - baseline_result[sensor],
                     2,
                 )
-                for sensor in ("temperature", "vibration", "motor_current", "rpm")
+                for sensor in (
+                    "temperature",
+                    "vibration",
+                    "motor_current",
+                    "rpm",
+                    "bearing_temperature_c",
+                    "coolant_flow_lpm",
+                    "lubrication_pressure_bar",
+                    "acoustic_noise_db",
+                )
             },
         }
 
     def advance_until_status(self, machine_id: str, target_status: str) -> dict[str, Any]:
         """Advance a live demonstration until a target risk state is reached."""
-        targets = {"WARNING": 0.40, "CRITICAL": 0.80}
+        targets = {"WARNING": WARNING_THRESHOLD, "CRITICAL": CRITICAL_THRESHOLD}
         if target_status not in targets:
             raise ValueError("target_status must be WARNING or CRITICAL")
         result = self.latest(machine_id)
@@ -255,13 +461,19 @@ class SpindleNadiService:
         maintenance_type: str = "Recommended inspection and service",
         recovery_fraction: float = 0.85,
     ) -> dict[str, Any]:
-        """Apply simulated wear recovery and record before/after verification."""
+        """Reduce simulated wear and verify the risk model for up to ten samples."""
         if not maintenance_type.strip():
             raise ValueError("maintenance_type cannot be empty")
         simulator = self._simulator(machine_id)
         before = self.latest(machine_id)
         remaining_wear = simulator.apply_maintenance(recovery_fraction)
-        after = self.advance(machine_id)
+        after = before
+        verification_samples = 0
+        for _ in range(10):
+            after = self.advance(machine_id)
+            verification_samples += 1
+            if after["status"] == "NORMAL":
+                break
         self._record_event(
             machine_id,
             "VIRTUAL_MAINTENANCE",
@@ -286,11 +498,23 @@ class SpindleNadiService:
         }
         self.maintenance_history.append(history_row)
         self._append_csv(self.maintenance_path, MAINTENANCE_FIELDS, history_row)
+        if before["status"] != "NORMAL" and after["status"] == "NORMAL":
+            self._record_alert(
+                after,
+                event_type="RECOVERED",
+                message=(
+                    f"Machine Recovered\n{machine_id} has returned to normal operating "
+                    "conditions after maintenance."
+                ),
+                send_external=True,
+            )
         return {
             "before": before,
             "after": after,
             "recovery_fraction": recovery_fraction,
-            "recovered": after["risk"] < before["risk"],
+            "recovered": after["status"] == "NORMAL",
+            "risk_improved": after["risk"] < before["risk"],
+            "verification_samples": verification_samples,
             "revision": self._revision[machine_id],
         }
 
@@ -356,7 +580,25 @@ class SpindleNadiService:
                 f"Prototype RUL is {copilot['rul_hours']:.2f} simulated hours. {observed} "
                 "This is simulator-based, not a real failure-time promise."
             )
-        if any(word in normalized for word in ("inspect", "maintenance", "action", "fix")):
+        if any(
+            word in normalized
+            for word in (
+                "inspect",
+                "maintenance",
+                "action",
+                "fix",
+                "solve",
+                "recommend",
+                "should i",
+                "should we",
+                "what should",
+                "what can i do",
+                "how can i",
+                "next step",
+                "do now",
+                "help",
+            )
+        ):
             return f"{copilot['urgency']} Suggested action: {copilot['recommendation']}"
         if any(word in normalized for word in ("workload", "what if", "scenario")):
             return (
@@ -373,7 +615,7 @@ class SpindleNadiService:
         """Return the last observed point before the model first entered warning."""
         records = self.session_records[machine_id]
         for index, record in enumerate(records):
-            if record["risk"] >= 0.40:
+            if record["risk"] >= WARNING_THRESHOLD:
                 if index == 0:
                     return None
                 previous = records[index - 1]
@@ -422,7 +664,7 @@ class SpindleNadiService:
     def observed_warning_lead_time(self, machine_id: str) -> float | None:
         """Measure risk-warning lead over fixed-limit alarm in this recorded trace."""
         records = self.session_records[machine_id]
-        model_warning = next((row for row in records if row["risk"] >= 0.40), None)
+        model_warning = next((row for row in records if row["risk"] >= WARNING_THRESHOLD), None)
         fixed_alarm = next((row for row in records if self.comparison(row)["fixed_alarm"]), None)
         if model_warning is None or fixed_alarm is None:
             return None
@@ -432,9 +674,11 @@ class SpindleNadiService:
         )
 
     def _enrich(self, reading: dict[str, Any], analysis: MachineAnalysis) -> dict[str, Any]:
+        risk = min(1.0, max(0.0, analysis.risk))
         return {
             **reading,
-            "risk": analysis.risk,
+            "risk": risk,
+            "health_score": round((1.0 - risk) * 100),
             "status": analysis.status,
             "anomaly_score": analysis.anomaly_score,
             "is_anomaly": analysis.is_anomaly,
@@ -463,10 +707,30 @@ class SpindleNadiService:
         }
         self.maintenance_history.append(row)
         self._append_csv(self.maintenance_path, MAINTENANCE_FIELDS, row)
+        if record["status"] in {"WARNING", "CRITICAL"}:
+            self._record_alert(
+                record,
+                event_type=record["status"],
+                message=(
+                    f"{record['status']}: {record['machine_id']} reached "
+                    f"{record['risk']:.0%} estimated risk. {recommendation}"
+                ),
+                send_external=record["status"] == "CRITICAL",
+            )
 
     @staticmethod
     def recommend_maintenance(explanations: list[dict[str, Any]]) -> str:
         features = " ".join(str(item["feature"]).lower() for item in explanations)
+        if "lubrication pressure" in features:
+            return "Inspect the lubrication reservoir, filter, lines, and pressure sensor."
+        if "coolant" in features:
+            return "Check coolant level, flow path, pump, and temperature before the next run."
+        if "bearing" in features or "vibration" in features:
+            return "Inspect spindle bearings, mounting, and alignment; confirm with a qualified technician."
+        if "tool wear" in features or "feed rate" in features:
+            return "Inspect the cutting tool and verify tool-wear measurements before adjusting the process."
+        if "spindle load" in features or "torque" in features:
+            return "Check the spindle load and cutting conditions against the approved operating recipe."
         if "vibration" in features:
             return "Inspect spindle and bearing condition; check for looseness or imbalance."
         if "motor current" in features:
@@ -482,6 +746,78 @@ class SpindleNadiService:
             return []
         with self.maintenance_path.open(newline="", encoding="utf-8") as history_file:
             rows = list(csv.DictReader(history_file))
+        for row in rows:
+            row["risk"] = float(row["risk"])
+        return rows
+
+    def _record_alert(
+        self,
+        record: dict[str, Any],
+        event_type: str,
+        message: str,
+        send_external: bool,
+    ) -> dict[str, Any]:
+        channels: dict[str, dict[str, str]] = {
+            "email": {"status": "not_sent", "detail": "Only critical and recovered events are sent."},
+            "whatsapp": {"status": "not_sent", "detail": "Only critical and recovered events are sent."},
+        }
+        if send_external:
+            if self.notifier is None:
+                channels = {
+                    name: {"status": "not_configured", "detail": "Configure Streamlit notification secrets."}
+                    for name in ("email", "whatsapp")
+                }
+            else:
+                try:
+                    channels = self.notifier.send(
+                        {
+                            "machine_id": str(record["machine_id"]),
+                            "status": event_type,
+                            "risk": float(record["risk"]),
+                            "message": message,
+                        }
+                    )
+                except (OSError, RuntimeError, ValueError) as error:
+                    channels = {
+                        name: {
+                            "status": "failed",
+                            "detail": f"Notification dispatch failed ({type(error).__name__}).",
+                        }
+                        for name in ("email", "whatsapp")
+                    }
+
+        row = {
+            "timestamp": str(record["timestamp"]),
+            "machine_id": str(record["machine_id"]),
+            "event_type": event_type,
+            "status": str(record["status"]),
+            "risk": float(record["risk"]),
+            "message": message,
+            "dashboard_status": "shown",
+            "email_status": channels.get("email", {}).get("status", "not_sent"),
+            "email_detail": channels.get("email", {}).get("detail", ""),
+            "whatsapp_status": channels.get("whatsapp", {}).get("status", "not_sent"),
+            "whatsapp_detail": channels.get("whatsapp", {}).get("detail", ""),
+        }
+        self.notification_history.append(row)
+        self._append_csv(self.notification_path, NOTIFICATION_FIELDS, row)
+        return row
+
+    def send_test_notification(self, machine_id: str) -> dict[str, Any]:
+        """Send an explicitly requested test message without changing machine state."""
+        record = self.latest(self._simulator(machine_id).machine_id)
+        return self._record_alert(
+            record,
+            event_type="TEST",
+            message=f"Spindle Nadi test notification for {machine_id}. No machine state was changed.",
+            send_external=True,
+        )
+
+    def _read_notification_history(self) -> list[dict[str, Any]]:
+        if not self.notification_path.exists():
+            return []
+        with self.notification_path.open(newline="", encoding="utf-8") as notification_file:
+            rows = list(csv.DictReader(notification_file))
         for row in rows:
             row["risk"] = float(row["risk"])
         return rows
@@ -508,9 +844,11 @@ class SpindleNadiService:
             latest = simulator.step().to_dict()
             projected = pd.concat([projected, pd.DataFrame([latest])], ignore_index=True)
         analysis = self.pipeline.analyze(projected)
+        risk = min(1.0, max(0.0, analysis.risk))
         return {
             **latest,
-            "risk": analysis.risk,
+            "risk": risk,
+            "health_score": round((1.0 - risk) * 100),
             "status": analysis.status,
             "anomaly_score": analysis.anomaly_score,
             "is_anomaly": analysis.is_anomaly,

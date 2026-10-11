@@ -10,8 +10,23 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from backend.service import SpindleNadiService
+from backend.esp32_serial import PHYSICAL_CHANNELS, Esp32SerialReader, list_esp32_ports
+from backend.notifications import notifier_from_streamlit_secrets
+from frontend.alert_messages import spoken_status_message
+from frontend.audio_alerts import render_status_announcement
 from data.generate_data import DEFAULT_OUTPUT, generate_dataset
+from data.recorded_replay import (
+    NUMERIC_CHANNELS,
+    list_excel_sheets,
+    list_supported_archive_members,
+    parse_recorded_file,
+    read_supported_archive_member,
+    sensor_columns,
+)
+from ml.features import REQUIRED_SENSOR_COLUMNS
 from ml.pipeline import SpindleNadiPipeline
+from ml.prediction.risk_model import CRITICAL_THRESHOLD, WARNING_THRESHOLD
+from simulator import FAULT_MODES
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 STATUS_COLORS = {"NORMAL": "#38d39f", "WARNING": "#ffc857", "CRITICAL": "#ff647c"}
@@ -21,6 +36,32 @@ CHART_COLORS = {
     "motor_current": "#4dc6d5",
     "rpm": "#62a5ff",
 }
+FAULT_LABELS = {
+    "bearing_wear": "Bearing wear",
+    "cooling_degradation": "Cooling degradation",
+    "lubrication_loss": "Lubrication loss",
+    "tool_wear": "Tool wear",
+    "spindle_imbalance": "Spindle imbalance",
+}
+SENSOR_LABELS = {
+    "temperature": "Temperature (°C)",
+    "vibration": "Overall vibration (mm/s)",
+    "vibration_x": "Vibration X (mm/s)",
+    "vibration_y": "Vibration Y (mm/s)",
+    "vibration_z": "Vibration Z (mm/s)",
+    "motor_current": "Motor current (A)",
+    "rpm": "Spindle speed (RPM)",
+    "spindle_load_pct": "Spindle load (%)",
+    "torque_nm": "Torque (N·m)",
+    "bearing_temperature_c": "Bearing temperature (°C)",
+    "coolant_flow_lpm": "Coolant flow (L/min)",
+    "coolant_temperature_c": "Coolant temperature (°C)",
+    "lubrication_pressure_bar": "Lubrication pressure (bar)",
+    "acoustic_noise_db": "Acoustic level (dB)",
+    "feed_rate_mm_min": "Feed rate (mm/min)",
+    "tool_wear_pct_est": "Estimated tool wear (%)",
+    "power_kw_est": "Estimated power (kW)",
+}
 
 
 @st.cache_resource
@@ -28,7 +69,10 @@ def load_pipeline() -> SpindleNadiPipeline:
     training_path = Path(DEFAULT_OUTPUT)
     if not training_path.exists():
         generate_dataset(training_path)
-    return SpindleNadiPipeline(pd.read_csv(training_path))
+    training = pd.read_csv(training_path)
+    if REQUIRED_SENSOR_COLUMNS.difference(training.columns):
+        training = generate_dataset(training_path)
+    return SpindleNadiPipeline(training)
 
 
 def main() -> None:
@@ -70,7 +114,7 @@ def main() -> None:
     machine_id = _render_sidebar(service)
     selected = service.latest(machine_id)
 
-    overview_tab, live_tab, what_if_tab, twin_tab, why_tab, copilot_tab, maintenance_tab, timeline_tab, evidence_tab = st.tabs(
+    overview_tab, live_tab, what_if_tab, twin_tab, why_tab, copilot_tab, maintenance_tab, timeline_tab, evidence_tab, replay_tab, esp32_tab, alerts_tab = st.tabs(
         [
             "Fleet overview",
             "Live & trends",
@@ -81,12 +125,15 @@ def main() -> None:
             "Maintenance history",
             "Evidence timeline",
             "Evidence",
+            "Recorded data replay",
+            "ESP32 physical data",
+            "Alerts & messages",
         ]
     )
     with overview_tab:
         _render_fleet(service, machine_id)
     with live_tab:
-        _render_live(service, machine_id, selected)
+        _render_live(service, machine_id)
     with what_if_tab:
         _render_what_if(service, machine_id)
     with twin_tab:
@@ -101,12 +148,26 @@ def main() -> None:
         _render_maintenance(service, selected)
     with evidence_tab:
         _render_evidence(service, machine_id)
+    with replay_tab:
+        _render_recorded_replay()
+    with esp32_tab:
+        _render_esp32_telemetry()
+    with alerts_tab:
+        _render_alert_history(service, machine_id)
 
 
 def _initialize_service() -> None:
     if "service" not in st.session_state:
         try:
-            st.session_state.service = SpindleNadiService(pipeline=load_pipeline())
+            try:
+                notification_secrets = st.secrets.to_dict()
+            except (FileNotFoundError, RuntimeError):
+                notification_secrets = {}
+            notifier = notifier_from_streamlit_secrets(notification_secrets)
+            st.session_state.service = SpindleNadiService(
+                pipeline=load_pipeline(),
+                notifier=notifier,
+            )
             st.session_state.selected_machine = "CNC-01"
         except (OSError, ValueError, RuntimeError) as error:
             st.error(f"Could not start Spindle Nadi: {error}")
@@ -150,8 +211,14 @@ def _render_sidebar(service: SpindleNadiService) -> str:
         if _perform(lambda: (service.set_workload(machine_id, workload), service.advance(machine_id))):
             st.rerun()
 
+    fault_mode = st.sidebar.selectbox(
+        "Fault to simulate",
+        FAULT_MODES,
+        format_func=lambda mode: FAULT_LABELS[mode],
+        key=f"fault_mode_{machine_id}",
+    )
     if st.sidebar.button("Start gradual degradation", type="primary", width="stretch"):
-        if _perform(lambda: (service.start_degradation(machine_id), service.advance(machine_id))):
+        if _perform(lambda: (service.start_degradation(machine_id, fault_mode), service.advance(machine_id))):
             st.rerun()
     if st.sidebar.button("Advance 1 sample", width="stretch"):
         if _perform(lambda: service.advance(machine_id)):
@@ -173,10 +240,10 @@ def _render_sidebar(service: SpindleNadiService) -> str:
 
     st.sidebar.markdown("---")
     st.sidebar.markdown("#### Prototype state rules")
-    st.sidebar.markdown("- NORMAL: risk below 40%")
-    st.sidebar.markdown("- WARNING: risk from 40%")
-    st.sidebar.markdown("- CRITICAL: risk from 80%")
-    st.sidebar.caption("These thresholds apply only to this simulated prototype.")
+    st.sidebar.markdown("- NORMAL: risk below 50%")
+    st.sidebar.markdown("- WARNING: risk from 50% to below 85%")
+    st.sidebar.markdown("- CRITICAL: risk from 85%")
+    st.sidebar.caption("50–64% risk is WARNING. These thresholds apply only to this simulated prototype.")
     return machine_id
 
 
@@ -211,6 +278,7 @@ def _render_fleet(service: SpindleNadiService, selected_machine: str) -> None:
                 )
                 st.markdown(f"### {record['machine_id']}")
                 st.metric("Failure risk", f"{record['risk']:.0%}")
+                st.metric("Prototype health score", f"{record['health_score']}/100")
                 st.caption(f"Prototype RUL: {record['rul_hours']:.2f} simulated h")
                 st.caption(
                     f"Vibration {record['vibration']:.2f} mm/s · "
@@ -226,20 +294,98 @@ def _render_fleet(service: SpindleNadiService, selected_machine: str) -> None:
     )
 
 
-def _render_live(service: SpindleNadiService, machine_id: str, record: dict) -> None:
+@st.fragment(run_every="1s")
+def _render_live(service: SpindleNadiService, machine_id: str) -> None:
+    if st.toggle(
+        "Auto-stream synthetic readings (one new sample per second)",
+        key=f"auto_stream_{machine_id}",
+    ):
+        try:
+            service.advance(machine_id)
+        except (OSError, ValueError, RuntimeError) as error:
+            st.error(f"Live simulator update failed: {error}")
+            return
+    record = service.latest(machine_id)
+    speech_enabled = st.toggle(
+        "Enable spoken Hindi + English status alerts",
+        value=False,
+        key=f"spoken_alerts_{machine_id}",
+        help="Plays a short tone and spoken message only when this machine changes status.",
+    )
+    status_key = f"spoken_alert_status_{machine_id}"
+    previous_status = st.session_state.get(status_key)
+    announce_transition = previous_status is not None and previous_status != record["status"]
+    st.session_state[status_key] = record["status"]
+    if speech_enabled:
+        render_status_announcement(
+            record["status"],
+            machine_id,
+            record["risk"],
+            str(record["timestamp"]),
+            announce=announce_transition,
+        )
+        st.caption(
+            f"Current announcement: {spoken_status_message(record['status'], machine_id, record['risk'])} "
+            "· Browser speech availability varies; use the button to replay it."
+        )
     color = STATUS_COLORS[record["status"]]
     st.markdown(
         f'<span class="status-pill" style="color:{color}">{record["status"]}</span> '
-        f'<span class="muted">· {machine_id} · {record["scenario"]}</span>',
+        f'<span class="muted">· {machine_id} · {record["scenario"]} · '
+        f'injected mode: {FAULT_LABELS.get(record["fault_mode"], "None")}</span>',
         unsafe_allow_html=True,
     )
-    columns = st.columns(5)
-    columns[0].metric("Temperature", f"{record['temperature']:.1f} °C")
-    columns[1].metric("Vibration", f"{record['vibration']:.2f} mm/s")
-    columns[2].metric("Motor current", f"{record['motor_current']:.2f} A")
-    columns[3].metric("RPM", f"{record['rpm']:.0f}")
-    columns[4].metric("Workload", f"{record['workload']:.0f}%")
-    st.metric("Model-estimated failure risk", f"{record['risk']:.0%}")
+    st.caption("Synthetic simulator data · each streamed sample advances 0.1 simulated operating hours.")
+    if record["status"] == "WARNING":
+        st.warning(
+            f"Dashboard alert · {machine_id} is WARNING at {record['risk']:.0%} estimated risk. "
+            "Inspect the latest evidence and plan maintenance."
+        )
+    elif record["status"] == "CRITICAL":
+        st.error(
+            f"Critical alert · {machine_id} is CRITICAL at {record['risk']:.0%} estimated risk. "
+            "Check Alerts & messages for email/WhatsApp delivery status."
+        )
+    metrics = [
+        ("Temperature", f"{record['temperature']:.1f} °C"),
+        ("Vibration", f"{record['vibration']:.2f} mm/s"),
+        ("Vibration X", f"{record['vibration_x']:.2f} mm/s"),
+        ("Vibration Y", f"{record['vibration_y']:.2f} mm/s"),
+        ("Vibration Z", f"{record['vibration_z']:.2f} mm/s"),
+        ("Motor current", f"{record['motor_current']:.2f} A"),
+        ("RPM", f"{record['rpm']:.0f}"),
+        ("Spindle load", f"{record['spindle_load_pct']:.1f}%"),
+        ("Torque", f"{record['torque_nm']:.1f} N·m"),
+        ("Bearing temperature", f"{record['bearing_temperature_c']:.1f} °C"),
+        ("Coolant flow", f"{record['coolant_flow_lpm']:.1f} L/min"),
+        ("Coolant temperature", f"{record['coolant_temperature_c']:.1f} °C"),
+        ("Lubrication pressure", f"{record['lubrication_pressure_bar']:.2f} bar"),
+        ("Acoustic level", f"{record['acoustic_noise_db']:.1f} dB"),
+        ("Feed rate", f"{record['feed_rate_mm_min']:.0f} mm/min"),
+        ("Estimated tool wear", f"{record['tool_wear_pct_est']:.1f}%"),
+        ("Estimated power", f"{record['power_kw_est']:.2f} kW"),
+        ("Workload", f"{record['workload']:.0f}%"),
+    ]
+    for start in range(0, len(metrics), 5):
+        columns = st.columns(5)
+        for column, (label, value) in zip(columns, metrics[start : start + 5]):
+            column.metric(label, value)
+    st.caption("Tool wear and power are simulator estimates, not direct sensor measurements.")
+    risk_col, health_col, sensor_col = st.columns(3)
+    risk_col.metric("Model-estimated failure risk", f"{record['risk']:.0%}")
+    health_col.metric("Prototype health score", f"{record['health_score']}/100")
+    health_col.caption("100 × (1 − estimated risk); not measured equipment health.")
+    quality = service.sensor_health(record)
+    sensor_col.metric("Sensor data quality", f"{quality['quality_pct']}%", quality["status"])
+    with st.expander("Sensor-quality checks", expanded=quality["status"] != "HEALTHY"):
+        st.caption(
+            f"{quality['valid_channels']} of {quality['total_channels']} channels pass broad "
+            "plausibility checks. These ranges are illustrative, not manufacturer limits."
+        )
+        if quality["issues"]:
+            st.dataframe(pd.DataFrame(quality["issues"]), hide_index=True, width="stretch")
+        else:
+            st.success("All required channels are present, plausible, and fresh.")
     st.progress(int(record["risk"] * 100), text=f"Risk score · anomaly score {record['anomaly_score']:.0f}/100")
     if record["is_anomaly"]:
         st.warning("Latest sensor pattern is unusual relative to the simulated healthy baseline.")
@@ -248,23 +394,45 @@ def _render_live(service: SpindleNadiService, machine_id: str, record: dict) -> 
     if len(history) < 2:
         st.info("Advance more samples to build time-series trends.")
         return
+    st.subheader("Estimated risk trend")
+    st.line_chart(
+        history.set_index("operating_hours")[["risk"]],
+        y="risk",
+        height=180,
+    )
     st.subheader("Sensor trends")
+    chart_options = list(SENSOR_LABELS)
+    selected_signals = st.multiselect(
+        "Trend signals",
+        chart_options,
+        default=[
+            "temperature",
+            "vibration",
+            "bearing_temperature_c",
+            "coolant_flow_lpm",
+            "lubrication_pressure_bar",
+            "acoustic_noise_db",
+        ],
+        format_func=lambda column: SENSOR_LABELS[column],
+        key=f"trend_signals_{machine_id}",
+    )
+    if not selected_signals:
+        st.info("Choose at least one sensor to draw a trend.")
+        return
     chart_data = history.melt(
-        id_vars=["timestamp", "operating_hours"],
-        value_vars=["temperature", "vibration", "motor_current", "rpm"],
+        id_vars=["operating_hours"],
+        value_vars=selected_signals,
         var_name="sensor",
         value_name="reading",
     )
-    chart_data["sensor"] = chart_data["sensor"].replace(
-        {"temperature": "Temperature °C", "vibration": "Vibration mm/s", "motor_current": "Current A", "rpm": "RPM"}
-    )
+    chart_data["sensor"] = chart_data["sensor"].map(SENSOR_LABELS)
     chart = px.line(
         chart_data,
         x="operating_hours",
         y="reading",
         color="sensor",
         facet_row="sensor",
-        height=680,
+        height=max(400, 220 * len(selected_signals)),
         color_discrete_sequence=list(CHART_COLORS.values()),
         labels={"operating_hours": "Simulated operating hours", "reading": "Sensor reading"},
     )
@@ -285,17 +453,469 @@ def _render_live(service: SpindleNadiService, machine_id: str, record: dict) -> 
     )
 
 
+@st.cache_data(ttl=300, max_entries=8)
+def _load_replay_data(
+    contents: bytes,
+    filename: str,
+    member_name: str | None,
+    sheet_name: str | None,
+) -> pd.DataFrame:
+    return parse_recorded_file(contents, filename, member_name, sheet_name)
+
+
+def _render_recorded_replay() -> None:
+    st.subheader("Replay a benchmark or recorded sensor CSV")
+    st.caption(
+        "Upload CSV, whitespace-delimited TXT, Excel, or ZIP datasets for visualization. "
+        "Real timestamps are preserved; cycle data uses cycle order; files without either use a "
+        "synthetic one-second-per-row replay sequence. Uploaded benchmark channels are not scored by "
+        "the CNC model unless their meaning and units are independently validated."
+    )
+    uploaded = st.file_uploader(
+        "Recorded or benchmark data file",
+        type=["csv", "txt", "xlsx", "zip"],
+        key="recorded_csv_upload",
+    )
+    st.markdown("**Documentation only — PDF files are not parsed as sensor data.**")
+    documentation = st.file_uploader(
+        "Optional PDF reference / codebook",
+        type=["pdf"],
+        key="recorded_pdf_upload",
+    )
+    if documentation is not None:
+        st.caption(f"Reference file: {documentation.name} · {len(documentation.getvalue()):,} bytes")
+        st.download_button(
+            "Download PDF reference",
+            data=documentation.getvalue(),
+            file_name=Path(documentation.name).name,
+            mime="application/pdf",
+            key="download_uploaded_pdf_reference",
+        )
+
+    if uploaded is None:
+        st.info(
+            "Use CSV or Excel with headers where possible. Headerless 26-column C-MAPSS TXT files are "
+            "recognized as engine ID, cycle, three operating settings, and 21 generically named sensors."
+        )
+        return
+
+    contents = uploaded.getvalue()
+    member_name: str | None = None
+    sheet_name: str | None = None
+    try:
+        if uploaded.name.lower().endswith(".zip"):
+            members = list_supported_archive_members(contents)
+            if not members:
+                st.error("ZIP archive contains no supported CSV, TXT, or XLSX files.")
+                return
+            member_name = st.selectbox(
+                "Choose a data file from the ZIP archive",
+                members,
+                key=f"replay_member_{uploaded.name}",
+            )
+            st.caption("Archive data is read in memory; files are not extracted into the project.")
+        source_name = member_name or uploaded.name
+        if source_name.lower().endswith(".xlsx"):
+            workbook_bytes = (
+                read_supported_archive_member(contents, member_name)
+                if member_name is not None
+                else contents
+            )
+            sheets = list_excel_sheets(workbook_bytes)
+    except ValueError as error:
+        st.error(f"Data file could not be inspected: {error}")
+        return
+    else:
+        if source_name.lower().endswith(".xlsx"):
+            sheet_name = st.selectbox(
+                "Excel worksheet",
+                sheets,
+                key=f"replay_sheet_{uploaded.name}_{member_name or 'direct'}",
+            )
+
+    try:
+        replay = _load_replay_data(contents, uploaded.name, member_name, sheet_name)
+    except ValueError as error:
+        st.error(f"Recorded data could not be loaded: {error}")
+        return
+
+    available_channels = sensor_columns(replay)
+    if not available_channels:
+        st.error("No numeric measurement columns were found in this dataset.")
+        return
+    st.caption(
+        f"Loaded {len(replay):,} rows from {source_name}. Columns are standardized only where their "
+        "headers have a known meaning; unknown benchmark sensors keep their source names."
+    )
+
+    machine_options = list(dict.fromkeys(replay["machine_id"].astype(str)))
+    if len(machine_options) > 1:
+        selected_machine = st.selectbox("Engine / machine", machine_options, key=f"replay_engine_{uploaded.name}")
+        replay_view = replay[replay["machine_id"].astype(str) == selected_machine].reset_index(drop=True)
+    else:
+        selected_machine = machine_options[0]
+        replay_view = replay
+
+    canonical_fields = [
+        ("temperature", "Temperature"),
+        ("vibration", "Vibration"),
+        ("motor_current", "Motor current"),
+        ("rpm", "RPM"),
+    ]
+    with st.expander("Optional column mapping for display"):
+        st.caption(
+            "Mappings change display labels only. Map an unknown channel to a CNC quantity only if the "
+            "dataset codebook confirms its physical meaning and units. No model score is produced from these mappings."
+        )
+        mappings: dict[str, str] = {}
+        duplicate_mapping_sources: set[str] = set()
+        for field, label in canonical_fields:
+            existing = field if field in available_channels else None
+            default_index = available_channels.index(existing) + 1 if existing else 0
+            source_column = st.selectbox(
+                f"Map source column to {label}",
+                ["Not mapped", *available_channels],
+                index=default_index,
+                key=f"replay_mapping_{uploaded.name}_{field}",
+            )
+            if source_column != "Not mapped":
+                if source_column in mappings:
+                    duplicate_mapping_sources.add(source_column)
+                else:
+                    mappings[source_column] = f"{label} (mapped)"
+        if duplicate_mapping_sources:
+            st.warning(
+                "Each source column can map to only one display label. "
+                "Duplicate selections keep the first mapping."
+            )
+
+    default_channels = [channel for channel in NUMERIC_CHANNELS if channel in available_channels]
+    if not default_channels:
+        default_channels = available_channels[: min(5, len(available_channels))]
+    selected_channels = st.multiselect(
+        "Measurement columns to chart",
+        available_channels,
+        default=default_channels,
+        key=f"replay_channels_{uploaded.name}_{member_name or 'direct'}_{sheet_name or 'default'}",
+    )
+    if not selected_channels:
+        st.info("Select at least one numeric measurement column to chart.")
+        return
+
+    time_column = (
+        "timestamp" if "timestamp" in replay_view
+        else "replay_time" if "replay_time" in replay_view
+        else "replay_time_seconds"
+    )
+    time_label = {
+        "timestamp": "Recorded timestamp",
+        "replay_time": "Recorded cycle / replay time (source units)",
+        "replay_time_seconds": "Synthetic replay time (seconds; 1 second per row)",
+    }[time_column]
+    if len(replay_view) > 1:
+        step = st.select_slider(
+            "Replay step size (samples per click)",
+            options=[1, 2, 5, 10, 25, 50],
+            value=1,
+            key=f"replay_speed_{uploaded.name}",
+        )
+        sample_key = f"recorded_replay_index_{uploaded.name}"
+        previous_col, next_col = st.columns(2)
+        if previous_col.button("Previous samples", key=f"replay_previous_{uploaded.name}"):
+            st.session_state[sample_key] = max(0, st.session_state.get(sample_key, 0) - step)
+        if next_col.button("Next samples", key=f"replay_next_{uploaded.name}"):
+            st.session_state[sample_key] = min(
+                len(replay_view) - 1,
+                st.session_state.get(sample_key, 0) + step,
+            )
+        index = st.slider(
+            "Recorded sample",
+            min_value=0,
+            max_value=len(replay_view) - 1,
+            value=0,
+            key=sample_key,
+        )
+    else:
+        index = 0
+    record = replay_view.iloc[index]
+    if time_column == "timestamp":
+        time_context = str(record["timestamp"])
+    elif time_column == "replay_time":
+        time_context = f"cycle/time {record['replay_time']} (source units)"
+    else:
+        time_context = f"synthetic t={record['replay_time_seconds']:.0f}s"
+    st.caption(
+        f"Recorded dataset · {record['machine_id']} · {time_context} · "
+        f"sample {index + 1} of {len(replay_view)}"
+    )
+    for start in range(0, len(selected_channels), 4):
+        columns = st.columns(4)
+        for column, channel in zip(columns, selected_channels[start : start + 4]):
+            value = record[channel]
+            display = "missing" if pd.isna(value) else f"{value:,.3f}"
+            label = mappings.get(channel, SENSOR_LABELS.get(channel, channel.replace("_", " ").title()))
+            column.metric(label, display)
+
+    plot_data = replay_view.melt(
+        id_vars=[time_column],
+        value_vars=selected_channels,
+        var_name="sensor",
+        value_name="reading",
+    )
+    plot_data["sensor"] = plot_data["sensor"].map(
+        lambda channel: mappings.get(
+            channel, SENSOR_LABELS.get(channel, channel.replace("_", " ").title())
+        )
+    )
+    figure = px.line(
+        plot_data,
+        x=time_column,
+        y="reading",
+        color="sensor",
+        facet_row="sensor",
+        height=max(350, 200 * len(selected_channels)),
+        labels={
+            time_column: time_label,
+            "reading": "Recorded value",
+        },
+    )
+    figure.update_layout(template="plotly_dark", showlegend=False)
+    figure.update_yaxes(matches=None)
+    st.plotly_chart(figure, width="stretch")
+    st.dataframe(replay, hide_index=True, width="stretch")
+    st.warning(
+        "Replay is visualization-only. Unknown sensor names retain their dataset labels; mappings are for "
+        "display and do not validate physical meaning, convert units, or enable CNC-model scoring. No "
+        "missing values are filled and no physical machine is controlled."
+    )
+
+
+@st.fragment(run_every="500ms")
+def _render_esp32_telemetry() -> None:
+    st.subheader("ESP32 physical sensor stream")
+    st.caption(
+        "USB serial JSON Lines receiver. Only values arriving from the selected device are displayed; "
+        "these readings are not mixed into synthetic machine data or assigned a model risk score."
+    )
+    try:
+        ports = list_esp32_ports()
+    except (ImportError, OSError) as error:
+        st.error(f"Could not list serial ports: {error}")
+        return
+
+    if not ports:
+        st.info("No serial ports detected. Connect the ESP32 by USB and refresh this page.")
+    port_labels = {device: f"{device} — {description}" for device, description in ports}
+    reader: Esp32SerialReader | None = st.session_state.get("esp32_serial_reader")
+    is_connected = reader is not None and not reader.closed
+    selected_port = st.selectbox(
+        "ESP32 serial port",
+        list(port_labels),
+        format_func=lambda device: port_labels[device],
+        disabled=not ports or is_connected,
+        key="esp32_port",
+    )
+    baudrate = st.selectbox(
+        "Baud rate",
+        [115200, 9600, 19200, 38400, 57600, 230400],
+        disabled=is_connected,
+        key="esp32_baudrate",
+    )
+
+    start, stop = st.columns(2)
+    if start.button("Connect ESP32", type="primary", disabled=is_connected or not ports):
+        try:
+            st.session_state.esp32_serial_reader = Esp32SerialReader(selected_port, baudrate)
+            st.session_state.esp32_serial_records = []
+            st.session_state.esp32_serial_errors = []
+            st.rerun(scope="fragment")
+        except (OSError, ValueError, ImportError) as error:
+            st.error(f"ESP32 connection failed: {error}")
+    if stop.button("Disconnect ESP32", disabled=not is_connected):
+        reader.close()
+        st.session_state.esp32_serial_reader = None
+        st.rerun(scope="fragment")
+
+    reader = st.session_state.get("esp32_serial_reader")
+    if reader is None or reader.closed:
+        st.info("Connect a device to begin receiving physical sensor readings.")
+        return
+    st.success("Connected · waiting for calibrated sensor messages")
+    records: list[dict[str, str | float]] = st.session_state.setdefault("esp32_serial_records", [])
+    errors: list[str] = st.session_state.setdefault("esp32_serial_errors", [])
+    try:
+        new_records, new_errors = reader.read_available()
+    except (OSError, ValueError) as error:
+        st.error(f"ESP32 serial read failed: {error}")
+        reader.close()
+        st.session_state.esp32_serial_reader = None
+        return
+    records.extend(new_records)
+    errors.extend(new_errors)
+    del records[:-1000]
+    del errors[:-10]
+    if errors:
+        st.warning(f"Skipped {len(errors)} invalid serial line(s). Latest issue: {errors[-1]}")
+    if not records:
+        st.info("No complete sensor messages received yet. Check the ESP32 JSON Lines format and baud rate.")
+        return
+
+    latest = records[-1]
+    st.caption(
+        f"Source: {latest['data_source']} · Device: {latest['machine_id']} · "
+        f"Received at: {latest['timestamp']} · {len(records)} samples"
+    )
+    physical_channels = [channel for channel in PHYSICAL_CHANNELS if channel in latest]
+    for offset in range(0, len(physical_channels), 4):
+        columns = st.columns(4)
+        for column, channel in zip(columns, physical_channels[offset : offset + 4]):
+            column.metric(SENSOR_LABELS[channel], f"{latest[channel]:,.3f}")
+    if len(records) > 1 and physical_channels:
+        frame = pd.DataFrame(records)
+        chart_data = frame.melt(
+            id_vars=["timestamp"],
+            value_vars=physical_channels,
+            var_name="sensor",
+            value_name="reading",
+        )
+        chart_data["sensor"] = chart_data["sensor"].map(SENSOR_LABELS)
+        chart = px.line(
+            chart_data,
+            x="timestamp",
+            y="reading",
+            color="sensor",
+            facet_row="sensor",
+            height=max(350, 200 * len(physical_channels)),
+            labels={"timestamp": "Device timestamp", "reading": "Calibrated sensor value"},
+        )
+        chart.update_layout(template="plotly_dark", showlegend=False)
+        chart.update_yaxes(matches=None)
+        st.plotly_chart(chart, width="stretch")
+    st.download_button(
+        "Download ESP32 readings",
+        data=pd.DataFrame(records).to_csv(index=False).encode("utf-8"),
+        file_name="spindle_nadi_esp32_physical_readings.csv",
+        mime="text/csv",
+    )
+    st.warning(
+        "Send calibrated engineering-unit values with canonical JSON keys. Raw ADC counts must not be "
+        "reported as °C, A, or mm/s. A real-machine risk model requires validated training data and "
+        "calibrated sensor baselines; this physical stream does not use the synthetic model."
+    )
+
+
+def _render_alert_history(service: SpindleNadiService, machine_id: str) -> None:
+    st.subheader("Alert delivery and recovery")
+    st.caption(
+        "NORMAL produces no message. WARNING stays in the dashboard. CRITICAL and verified post-maintenance "
+        "recovery attempt configured email and WhatsApp channels."
+    )
+    notifier = service.notifier
+    if notifier is not None and hasattr(notifier, "configuration_status"):
+        configured = notifier.configuration_status()
+    else:
+        configured = {"email": False, "whatsapp": False}
+    email_col, whatsapp_col = st.columns(2)
+    email_col.metric("Email", "Configured" if configured["email"] else "Not configured")
+    whatsapp_col.metric("WhatsApp", "Configured" if configured["whatsapp"] else "Not configured")
+    st.caption(
+        "Each channel supports up to 10 recipients. Configure the email `recipients` "
+        "and WhatsApp `to_numbers` lists in `.streamlit/secrets.toml`."
+    )
+    if not any(configured.values()):
+        st.info(
+            "Add provider settings to `.streamlit/secrets.toml` using the example in "
+            "`docs/notifications.md`. Secrets are never shown in this dashboard."
+        )
+
+    st.download_button(
+        "Download maintenance report",
+        data=service.maintenance_report(machine_id).encode("utf-8"),
+        file_name=f"{machine_id.lower().replace('-', '_')}_maintenance_report.md",
+        mime="text/markdown",
+        key=f"maintenance_report_{machine_id}",
+    )
+    st.caption(
+        "The report includes current model evidence, trend, sensor-quality findings, "
+        "recommendation, and this machine's alert and maintenance history."
+    )
+
+    if st.button("Send test notification", key="send_notification_test"):
+        outcome = service.send_test_notification(machine_id)
+        details = (
+            f"Email: {outcome['email_status']} — {outcome['email_detail']}\n\n"
+            f"WhatsApp: {outcome['whatsapp_status']} — {outcome['whatsapp_detail']}"
+        )
+        if any(
+            outcome[key] == "sent"
+            for key in ("email_status", "whatsapp_status")
+        ):
+            st.success(details)
+        else:
+            st.warning(details)
+        st.caption("This sends a real test message on each configured channel and may incur provider charges.")
+
+    history = pd.DataFrame(service.notification_history)
+    if history.empty:
+        st.info("No WARNING, CRITICAL, recovery, or test alerts have been recorded in this session.")
+        return
+    display = history.sort_values("timestamp", ascending=False).copy()
+    display = display.rename(
+        columns={
+            "timestamp": "Time",
+            "machine_id": "Machine",
+            "event_type": "Event",
+            "status": "Machine state",
+            "risk": "Risk",
+            "message": "Message",
+            "dashboard_status": "Dashboard",
+            "email_status": "Email",
+            "email_detail": "Email result",
+            "whatsapp_status": "WhatsApp",
+            "whatsapp_detail": "WhatsApp result",
+        }
+    )
+    st.dataframe(
+        display[
+            [
+                "Time",
+                "Machine",
+                "Event",
+                "Machine state",
+                "Risk",
+                "Message",
+                "Dashboard",
+                "Email",
+                "Email result",
+                "WhatsApp",
+                "WhatsApp result",
+            ]
+        ],
+        hide_index=True,
+        width="stretch",
+    )
+    st.download_button(
+        "Download alert history",
+        data=history.to_csv(index=False).encode("utf-8"),
+        file_name="spindle_nadi_notification_history.csv",
+        mime="text/csv",
+    )
+
+
 def _render_what_if(service: SpindleNadiService, machine_id: str) -> None:
-    st.subheader(f"What if workload changes on {machine_id}?")
+    st.subheader(f"What if operating conditions change on {machine_id}?")
     current_workload = service.simulators[machine_id].workload
+    current_rpm = service.simulators[machine_id].rpm_setpoint
     key = f"what_if_result_{machine_id}"
     with st.form(f"what_if_form_{machine_id}"):
-        workload = st.slider(
-            "Alternative workload (%)",
-            min_value=0,
-            max_value=100,
-            value=min(100, int(current_workload + 25)),
+        workload_col, rpm_col = st.columns(2)
+        workload = workload_col.slider(
+            "Alternative workload (%)", 0, 100, min(100, int(current_workload + 25)),
             key=f"what_if_load_{machine_id}",
+        )
+        rpm_setpoint = rpm_col.slider(
+            "Alternative spindle speed (RPM)", 500, 12_000, int(current_rpm), step=100,
+            key=f"what_if_rpm_{machine_id}",
         )
         samples = st.slider(
             "Projection horizon (samples)",
@@ -307,7 +927,9 @@ def _render_what_if(service: SpindleNadiService, machine_id: str) -> None:
         run_projection = st.form_submit_button("Run paired what-if")
     if run_projection:
         try:
-            st.session_state[key] = service.compare_workload(machine_id, workload, samples)
+            st.session_state[key] = service.compare_workload(
+                machine_id, workload, samples, rpm_setpoint=rpm_setpoint
+            )
         except (OSError, ValueError, RuntimeError) as error:
             st.error(f"What-if projection failed: {error}")
             return
@@ -327,8 +949,10 @@ def _render_what_if(service: SpindleNadiService, machine_id: str) -> None:
     right.metric("What-if projected risk", f"{alternate['risk']:.0%}", alternate["status"])
     delta.metric("Risk difference", f"{projection['risk_delta']:+.0%}")
     st.caption(
-        f"Projected {projection['samples']} samples at {projection['current_workload']:.0f}% "
-        f"baseline workload vs {projection['what_if_workload']:.0f}% alternative workload."
+        f"Projected {projection['samples']} paired samples: workload "
+        f"{projection['current_workload']:.0f}% → {projection['what_if_workload']:.0f}%; "
+        f"spindle setpoint {projection['current_rpm_setpoint']:.0f} → "
+        f"{projection['what_if_rpm_setpoint']:.0f} RPM."
     )
     sensor_rows = [
         {
@@ -346,9 +970,9 @@ def _render_what_if(service: SpindleNadiService, machine_id: str) -> None:
     ]
     st.dataframe(pd.DataFrame(sensor_rows), hide_index=True, width="stretch")
     st.info(
-        "Workload-adjusted features are designed to distinguish expected load-related sensor changes "
-        "from degradation. A workload increase can raise raw temperature/current without necessarily "
-        "raising the model's estimated risk. This is a synthetic counterfactual, not a physical twin."
+        "The RPM setpoint changes the projected sensor generation and its operating-point-adjusted "
+        "features; workload changes are normalized in the same way. This paired synthetic counterfactual "
+        "does not mutate the live machine and is not a physical twin."
     )
 
 
@@ -512,19 +1136,38 @@ def _render_copilot(service: SpindleNadiService, machine_id: str) -> None:
         st.markdown(f"**Suggested action:** {copilot['recommendation']}")
         st.caption(copilot["disclaimer"])
 
-    question = st.text_input(
-        "Ask about this machine",
-        placeholder="Why is risk increasing? What maintenance is suggested?",
-        key=f"copilot_question_{machine_id}",
+    chat_key = f"copilot_messages_{machine_id}"
+    if chat_key not in st.session_state:
+        st.session_state[chat_key] = [
+            {
+                "role": "assistant",
+                "content": (
+                    f"I'm the local maintenance copilot for {machine_id}. Ask me why risk is changing, "
+                    "what to inspect, or what the prototype RUL means."
+                ),
+            }
+        ]
+    messages = st.session_state[chat_key]
+    for message in messages:
+        with st.chat_message(message["role"]):
+            st.write(message["content"])
+
+    question = st.chat_input(
+        "Ask about risk, evidence, RUL, or maintenance",
+        key=f"copilot_chat_input_{machine_id}",
+        max_chars=500,
     )
-    if st.button("Ask copilot", key=f"copilot_ask_{machine_id}"):
+    if question:
+        messages.append({"role": "user", "content": question})
         try:
-            st.session_state[f"copilot_answer_{machine_id}"] = service.answer_copilot_question(machine_id, question)
+            answer = service.answer_copilot_question(machine_id, question)
         except ValueError as error:
-            st.error(str(error))
-    answer = st.session_state.get(f"copilot_answer_{machine_id}")
-    if answer:
-        st.info(answer)
+            answer = str(error)
+        messages.append({"role": "assistant", "content": answer})
+        st.rerun()
+    if st.button("Clear conversation", key=f"copilot_clear_{machine_id}"):
+        st.session_state[chat_key] = []
+        st.rerun()
 
     st.subheader("Virtual maintenance simulator")
     st.caption("Apply a virtual wear reduction, then verify the model-estimated risk and status after the next sample.")
@@ -570,9 +1213,19 @@ def _render_copilot(service: SpindleNadiService, machine_id: str) -> None:
         columns[2].metric("Status before", before["status"])
         columns[3].metric("Status after", after["status"])
         if outcome["recovered"]:
-            st.success("Recovery verified: the simulated model risk decreased after virtual maintenance.")
+            st.success(
+                f"Recovery verified: the model returned to NORMAL after "
+                f"{outcome['verification_samples']} post-maintenance samples."
+            )
+        elif outcome["risk_improved"]:
+            st.warning(
+                f"Risk improved, but status is still {after['status']}; no RECOVERED notification was sent."
+            )
         else:
-            st.warning("No risk reduction was measured after service; inspect the evidence and do not assume recovery.")
+            st.warning(
+                "The model did not return to NORMAL within the verification window; no RECOVERED "
+                "notification was sent. Inspect the evidence and do not assume recovery."
+            )
         st.caption("Virtual result only. No physical machine action was performed.")
 
 
@@ -593,8 +1246,12 @@ def _render_timeline(service: SpindleNadiService, machine_id: str) -> None:
             markers=True,
             labels={"operating_hours": "Simulated operating hours", "risk": "Estimated risk"},
         )
-        chart.add_hline(y=0.4, line_dash="dash", line_color="#ffc857", annotation_text="Warning")
-        chart.add_hline(y=0.8, line_dash="dash", line_color="#ff647c", annotation_text="Critical")
+        chart.add_hline(
+            y=WARNING_THRESHOLD, line_dash="dash", line_color="#ffc857", annotation_text="Warning"
+        )
+        chart.add_hline(
+            y=CRITICAL_THRESHOLD, line_dash="dash", line_color="#ff647c", annotation_text="Critical"
+        )
         chart.update_layout(
             template="plotly_dark",
             paper_bgcolor="#0b1116",
@@ -655,7 +1312,7 @@ def _render_evidence(service: SpindleNadiService, machine_id: str) -> None:
     cells[3].metric("F1 score", f"{metrics['f1']:.2f}")
     st.caption(
         f"Test set: {int(metrics['test_samples'])} samples from {int(metrics['test_machines'])} held-out machines. "
-        "Failure-class metrics use the 40% WARNING threshold."
+        f"Failure-class metrics use the {WARNING_THRESHOLD:.0%} WARNING threshold."
     )
     matrix = pd.DataFrame(
         metrics["confusion_matrix"],

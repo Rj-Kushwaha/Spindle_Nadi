@@ -3,3 +3,5 @@ numpy>=1.26
 scikit-learn>=1.5
 plotly>=5.22
 streamlit>=1.50
+pyserial>=3.5
+openpyxl>=3.1

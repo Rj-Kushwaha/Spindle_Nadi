@@ -43,6 +43,9 @@ published online.
   approved cloud storage before relying on it.
 - This app contains no credentials and does not need secrets to run. Do not
   add real machine telemetry or secret keys to the public demo repository.
+- Optional email and WhatsApp alerts require secrets configured in the
+  Streamlit Community Cloud app settings. Follow
+  [`notifications.md`](notifications.md); never commit `.streamlit/secrets.toml`.
 - The simulator, risk scores, maintenance copilot, virtual repairs, and RUL are
   demonstrations based on synthetic data. Do not connect this app to physical
   machine controls or use its predictions as safety decisions.

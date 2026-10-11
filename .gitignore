@@ -10,4 +10,8 @@ __pycache__/
 data/generated/live_sensor_readings.csv
 data/generated/maintenance_history.csv
 data/generated/event_timeline.csv
+data/generated/notification_history.csv
 *.joblib
+.env
+node_modules/
+frontend/dist/

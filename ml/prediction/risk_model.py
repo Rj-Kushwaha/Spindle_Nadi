@@ -16,8 +16,17 @@ from sklearn.model_selection import GroupShuffleSplit
 
 from ml.features import FEATURE_COLUMNS
 
-WARNING_THRESHOLD = 0.40
-CRITICAL_THRESHOLD = 0.80
+WARNING_THRESHOLD = 0.50
+CRITICAL_THRESHOLD = 0.85
+
+
+def status_for_risk(risk: float) -> str:
+    """Map model-estimated risk to the prototype's operator-facing state."""
+    if risk >= CRITICAL_THRESHOLD:
+        return "CRITICAL"
+    if risk >= WARNING_THRESHOLD:
+        return "WARNING"
+    return "NORMAL"
 
 
 class FailureRiskModel:

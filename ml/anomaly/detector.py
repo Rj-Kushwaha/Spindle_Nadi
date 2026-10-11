@@ -32,8 +32,20 @@ class HealthyBaselineDetector:
             raise RuntimeError("Anomaly detector has not been fitted")
         values = features[FEATURE_COLUMNS]
         decision_score = float(self.model.decision_function(values)[0])
-        rank = int(np.searchsorted(self._healthy_scores, decision_score, side="left"))
-        healthy_percentile = rank / len(self._healthy_scores)
-        score = 100.0 * (0.05 - healthy_percentile) / 0.05
+        healthy_percentiles = np.linspace(0.0, 1.0, len(self._healthy_scores))
+        healthy_percentile = float(
+            np.interp(decision_score, self._healthy_scores, healthy_percentiles)
+        )
+        if decision_score < self._healthy_scores[0]:
+            healthy_span = float(
+                np.quantile(self._healthy_scores, 0.95)
+                - np.quantile(self._healthy_scores, 0.05)
+            )
+            healthy_span = max(healthy_span, np.finfo(float).eps)
+            healthy_percentile -= (
+                self._healthy_scores[0] - decision_score
+            ) / healthy_span * 0.05
+        tail_severity = max(0.0, 0.05 - healthy_percentile)
+        score = 100.0 * (1.0 - np.exp(-tail_severity / 0.05))
         is_anomaly = int(self.model.predict(values)[0]) == -1
         return round(float(np.clip(score, 0.0, 100.0)), 1), is_anomaly

@@ -10,9 +10,8 @@ from ml.anomaly.detector import HealthyBaselineDetector
 from ml.explainability.contributions import explain_risk
 from ml.features import FEATURE_COLUMNS, engineer_features
 from ml.prediction.risk_model import (
-    CRITICAL_THRESHOLD,
-    WARNING_THRESHOLD,
     FailureRiskModel,
+    status_for_risk,
 )
 from ml.rul.estimator import estimate_rul_hours
 
@@ -53,12 +52,7 @@ class SpindleNadiPipeline:
         latest = features.iloc[[-1]]
         risk = self.risk_model.predict(latest)
         anomaly_score, is_anomaly = self.anomaly_detector.score(latest)
-        if risk >= CRITICAL_THRESHOLD:
-            status = "CRITICAL"
-        elif risk >= WARNING_THRESHOLD:
-            status = "WARNING"
-        else:
-            status = "NORMAL"
+        status = status_for_risk(risk)
         return MachineAnalysis(
             risk=risk,
             status=status,

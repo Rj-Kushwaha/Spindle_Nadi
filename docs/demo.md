@@ -11,10 +11,18 @@ Open Fleet overview. Point out the priority ordering and select `CNC-01`.
 
 **0:20–0:45 — Gradual degradation**
 
-Click **Demo → warning**, then **Demo → critical**. Show the Live & trends tab.
+Choose a fault mode in the sidebar and click **Start gradual degradation**.
+Show the Live & trends tab and enable its one-second synthetic stream.
 
 > “We advance the machine through gradual degradation and show its sensor
-> trends and model-estimated risk as it moves through warning to critical.”
+> trends and model-estimated risk as it moves through warning to critical.
+> The selected fault is injected simulator behavior, not a field diagnosis.”
+
+For spoken alerts, open **Live & trends** and enable **Enable spoken Hindi +
+English status alerts**, then trigger a warning or critical transition from the
+sidebar. The browser plays a distinct tone and bilingual message. Use **Play
+announcement** if browser autoplay is blocked. These are local browser sounds,
+not email or WhatsApp alerts.
 
 **0:45–1:00 — WHY and Last Good Hour**
 
@@ -26,10 +34,18 @@ last-good sample, and clearly labeled prototype RUL.
 
 **1:00–1:20 — What-if**
 
-Open **What-if**, increase the workload, and run the paired projection.
+Open **What-if**, adjust workload and spindle-speed setpoint, and run the paired projection.
 
-> “We compare the baseline with an alternate workload over the same horizon.
-> This is a cloned scenario, so it does not change the live machine.”
+> “We compare the baseline with alternate workload and spindle-speed settings
+> over the same horizon. This is a cloned scenario, so it does not change the
+> live machine.”
+
+Point to the live sensor-quality check and prototype health score. In **Alerts
+& messages**, download the maintenance report.
+
+> “The health score is just the inverse of our model-estimated risk. Sensor
+> quality uses illustrative ranges. The report collects evidence and history;
+> none of these synthetic results is a safety assessment.”
 
 **1:20–1:35 — Digital-twin-style view**
 
@@ -39,13 +55,16 @@ Open **Digital twin** and hover the component markers.
 > a CAD or calibrated physics twin.”
 
 **1:35–1:55 — Maintenance copilot and service**
-
-Open **Maintenance copilot**, show the recommended action, then perform virtual
-maintenance and verify before/after risk.
+Open **Maintenance copilot**, ask a question in the chat, show the recommended
+action, then perform virtual maintenance and verify before/after risk.
 
 > “The copilot is local and grounded in the model result. We simulate wear
 > recovery and check if risk actually decreases; no physical machine is
 > controlled.”
+
+If alert credentials have been configured, open **Alerts & messages** to show
+the Critical transition and the recovery message delivery outcomes. Otherwise,
+show the dashboard alert and explicit `not_configured` provider status.
 
 **1:55–2:20 — Evidence**
 
@@ -55,6 +74,16 @@ the synthetic-data evaluation.
 > “Lead time is displayed only if both model warning and fixed-limit events
 > occurred in the recorded session. Metrics are from held-out synthetic
 > machines, not real-world validation.”
+
+Optionally open **Recorded data replay** and upload a timestamped benchmark CSV.
+This browses the recorded signals without claiming a live hardware connection or
+producing an AI risk score.
+
+If an ESP32 with calibrated sensor modules is available, open **ESP32 physical
+data**, connect its USB serial port, and show the physical measurements
+separately from the simulator. Follow [`esp32_setup.md`](esp32_setup.md) for the
+JSON message format; do not apply the synthetic model's risk score to this
+physical stream.
 
 **2:20–3:00 — Close**
 
