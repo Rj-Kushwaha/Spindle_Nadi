@@ -176,7 +176,7 @@ requirements.txt      Runtime dependencies
 ## GitHub
 
 For Streamlit Community Cloud deployment, follow
-[`docs/deployment.md`](docs/deployment.md). The app entry point is `app.py`,
+[`docs/deployment.md`](docs/dep./run.shloyment.md). The app entry point is `app.py`,
 and the runtime dependencies are in `requirements.txt`.
 
 Recorded CSV replay accepts a timestamp column (`timestamp`, `time`, or
